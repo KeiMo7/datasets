@@ -53,6 +53,10 @@ from typing import (
     overload,
 )
 
+
+if TYPE_CHECKING:
+    from .split_integrity import SplitIntegrityConfig
+
 import fsspec
 import multiprocess as mp
 import numpy as np
@@ -1813,6 +1817,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         num_shards: Optional[int] = None,
         num_proc: Optional[int] = None,
         storage_options: Optional[dict] = None,
+        split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     ):
         """
         Saves a dataset to a dataset directory, or in a filesystem using any implementation of `fsspec.spec.AbstractFileSystem`.
@@ -1842,6 +1847,14 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
                 Key/value pairs to be passed on to the file-system backend, if any.
 
                 <Added version="2.8.0"/>
+            split_integrity (`bool`, `dict` or [`SplitIntegrityConfig`], *optional*, defaults to `None`):
+                Opt-in content fingerprint sidecar. When enabled, a
+                `split_integrity.json` manifest is written next to `dataset_info.json`
+                with the split name, row count and a fingerprint computed from the
+                stored values and their order. [`Dataset.load_from_disk`] can then refuse
+                to load the directory if the data was replaced or corrupted.
+
+                <Added version="5.3.0"/>
 
         Example:
 
@@ -1849,6 +1862,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         >>> ds.save_to_disk("path/to/dataset/directory")
         >>> ds.save_to_disk("path/to/dataset/directory", max_shard_size="1GB")
         >>> ds.save_to_disk("path/to/dataset/directory", num_shards=1024)
+        >>> ds.save_to_disk("path/to/dataset/directory", split_integrity=True)
         ```
         """
         if max_shard_size is not None and num_shards is not None:
@@ -1966,6 +1980,38 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             sorted_keys_dataset_info = {key: dataset_info[key] for key in sorted(dataset_info)}
             json.dump(sorted_keys_dataset_info, dataset_info_file, indent=2)
 
+        if split_integrity:
+            from .split_integrity import (
+                SplitIntegrityConfig,
+                build_split_manifest,
+            )
+
+            integrity_config = SplitIntegrityConfig.coerce(split_integrity)
+            split_name = str(self.split) if self.split is not None else "default"
+            # Fingerprint the in-memory table in row order. This is the *same* logical
+            # sequence that load_from_disk will concatenate back from the shards, which
+            # is why sharding doesn't change the fingerprint.
+            split_files = {
+                split_name: [
+                    posixpath.join(os.path.basename(str(dataset_path)), data_file["filename"])
+                    for data_file in state["_data_files"]
+                ]
+            }
+            manifest = build_split_manifest(
+                {split_name: self},
+                dataset_id=self.info.dataset_name or os.path.basename(str(dataset_path).rstrip("/")),
+                revision=str(self.info.version) if self.info.version is not None else None,
+                split_method="as_provided",
+                id_columns=integrity_config.normalized_id_columns(),
+                include_sample_ids=integrity_config.include_sample_ids,
+                batch_size=integrity_config.batch_size,
+                num_proc=integrity_config.num_proc,
+                files=split_files,
+            )
+            integrity_path = posixpath.join(dataset_path, integrity_config.manifest_filename)
+            with fs.open(integrity_path, "w", encoding="utf-8") as f:
+                json.dump(manifest.to_dict(), f, indent=2, sort_keys=True)
+
     @staticmethod
     def _save_to_disk_single(
         job_id: int,
@@ -2019,6 +2065,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         dataset_path: PathLike,
         keep_in_memory: Optional[bool] = None,
         storage_options: Optional[dict] = None,
+        split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     ) -> "Dataset":
         """
         Loads a dataset that was previously saved using [`save_to_disk`] from a dataset directory, or from a
@@ -2037,6 +2084,14 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
                 Key/value pairs to be passed on to the file-system backend, if any.
 
                 <Added version="2.8.0"/>
+            split_integrity (`bool`, `dict` or [`SplitIntegrityConfig`], *optional*, defaults to `None`):
+                Opt-in verification against the `split_integrity.json` manifest written
+                by [`Dataset.save_to_disk`]. When enabled, the data read from disk is
+                re-fingerprinted and the load is refused with a
+                [`FingerprintMismatchError`] naming the inconsistent files if it doesn't
+                match the manifest.
+
+                <Added version="5.3.0"/>
 
         Returns:
             [`Dataset`] or [`DatasetDict`]:
@@ -2047,6 +2102,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
 
         ```py
         >>> ds = load_from_disk("path/to/dataset/directory")
+        >>> ds = load_from_disk("path/to/dataset/directory", split_integrity=True)
         ```
         """
         fs: fsspec.AbstractFileSystem
@@ -2104,16 +2160,31 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         keep_in_memory = keep_in_memory if keep_in_memory is not None else is_small_dataset(dataset_size)
         table_cls = InMemoryTable if keep_in_memory else MemoryMappedTable
 
-        arrow_table = concat_tables(
-            thread_map(
-                table_cls.from_file,
-                [posixpath.join(dest_dataset_path, data_file["filename"]) for data_file in state["_data_files"]],
-                tqdm_class=hf_tqdm,
-                desc="Loading dataset from disk",
-                # set `disable=None` rather than `disable=False` by default to disable progress bar when no TTY attached
-                disable=len(state["_data_files"]) <= 16 or None,
+        try:
+            arrow_table = concat_tables(
+                thread_map(
+                    table_cls.from_file,
+                    [posixpath.join(dest_dataset_path, data_file["filename"]) for data_file in state["_data_files"]],
+                    tqdm_class=hf_tqdm,
+                    desc="Loading dataset from disk",
+                    # set `disable=None` rather than `disable=False` by default to disable progress bar when no TTY attached
+                    disable=len(state["_data_files"]) <= 16 or None,
+                )
             )
-        )
+        except Exception as e:
+            if not split_integrity:
+                raise
+            # An unreadable Arrow stream is corruption. With integrity checking on we
+            # report it as such, naming the files involved.
+            from .exceptions import FingerprintMismatchError
+
+            files = [
+                posixpath.join(dest_dataset_path, data_file["filename"]) for data_file in state["_data_files"]
+            ]
+            raise FingerprintMismatchError(
+                f"Could not read {dest_dataset_path}: {type(e).__name__}: {e}. "
+                f"The cache file(s) were replaced or corrupted. Checked files: {files}."
+            ) from e
 
         split = state["_split"]
         split = Split(split) if split is not None else split
@@ -2132,6 +2203,66 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
             "output_all_columns": state["_output_all_columns"],
         }
         dataset = dataset.with_format(**format)
+
+        if split_integrity:
+            from .split_integrity import (
+                SplitIntegrityConfig,
+                SplitManifest,
+                compute_content_fingerprint,
+            )
+
+            integrity_config = SplitIntegrityConfig.coerce(split_integrity)
+            integrity_path = posixpath.join(dest_dataset_path, integrity_config.manifest_filename)
+            if not os.path.isfile(integrity_path):
+                if integrity_config.strict_missing_manifest:
+                    from .exceptions import SplitManifestError
+
+                    raise SplitManifestError(
+                        f"No split integrity manifest found at {integrity_path}. "
+                        "Save the dataset with `save_to_disk(..., split_integrity=True)` or pass "
+                        "`split_integrity={'strict_missing_manifest': False}` to load without verification."
+                    )
+            else:
+                with open(integrity_path, encoding="utf-8") as manifest_file:
+                    manifest = SplitManifest.from_dict(json.load(manifest_file))
+                split_name = str(split) if split is not None else "default"
+                if split_name not in manifest.fingerprints and len(manifest.fingerprints) == 1:
+                    # A Dataset saved without an explicit split gets the "default" key;
+                    # tolerate a single-split manifest regardless of how it was named.
+                    split_name = next(iter(manifest.fingerprints))
+                if split_name not in manifest.fingerprints:
+                    from .exceptions import FingerprintMismatchError
+
+                    raise FingerprintMismatchError(
+                        f"The split integrity manifest at {integrity_path} describes splits "
+                        f"{sorted(manifest.fingerprints)} but the loaded dataset has split {split_name!r}. "
+                        "Refusing to use data whose content is unverified."
+                    )
+                expected = manifest.fingerprints[split_name]
+                actual = compute_content_fingerprint(
+                    dataset, batch_size=integrity_config.batch_size, num_proc=integrity_config.num_proc
+                )
+                if actual != expected:
+                    files = manifest.files.get(split_name) if manifest.files else None
+                    file_hint = f" Inconsistent cache file(s): {files}." if files else ""
+                    from .exceptions import FingerprintMismatchError
+
+                    raise FingerprintMismatchError(
+                        f"Content fingerprint mismatch for split '{split_name}' in {dest_dataset_path}: "
+                        f"manifest records {expected} but the loaded data hashes to {actual}. "
+                        f"The cache file(s) were replaced or corrupted.{file_hint}"
+                    )
+                dataset._split_integrity = {
+                    "dataset_id": manifest.dataset_id,
+                    "revision": manifest.revision,
+                    "split_method": manifest.split_method,
+                    "seed": manifest.seed,
+                    "ratios": manifest.ratios,
+                    "id_columns": manifest.id_columns,
+                    "split": split_name,
+                    "num_samples": manifest.num_samples.get(split_name),
+                    "fingerprint": expected,
+                }
 
         return dataset
 
@@ -2172,6 +2303,48 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         if self._indices is not None:
             cache_files += list_table_cache_files(self._indices)
         return [{"filename": cache_filename} for cache_filename in cache_files]
+
+    def content_fingerprint(self, batch_size: int = 1000, num_proc: Optional[int] = None) -> str:
+        """Return the order-sensitive fingerprint of this split's content.
+
+        The fingerprint hashes the stored column values and their order. It does not use
+        file names, modification times or sizes, so it is stable across shard layouts and
+        changes whenever the data itself changes. This method is read-only and is not
+        enabled by default anywhere else.
+
+        Args:
+            batch_size (`int`, defaults to `1000`): rows hashed at a time. Only affects
+                memory and speed, never the result.
+            num_proc (`int`, *optional*): worker processes. The result is identical to
+                the sequential computation.
+
+        Example:
+
+        ```py
+        >>> ds.content_fingerprint()
+        '4f7c...'
+        ```
+        """
+        from .split_integrity import compute_content_fingerprint
+
+        return compute_content_fingerprint(self, batch_size=batch_size, num_proc=num_proc)
+
+    def sample_identifiers(
+        self,
+        id_columns: Union[str, list[str]] = "id",
+        batch_size: int = 1000,
+    ) -> list[Any]:
+        """Return this split's sample identifiers in row order (used by overlap checks)."""
+        from .split_integrity import compute_sample_identifiers
+
+        return compute_sample_identifiers(self, id_columns=id_columns, batch_size=batch_size)
+
+    def _split_cache_files(self) -> list[str]:
+        """Cache file names backing this split (empty when the data is in memory)."""
+        try:
+            return [entry["filename"] for entry in self.cache_files]
+        except Exception:  # pragma: no cover - defensive, e.g. unusual table backends
+            return []
 
     @property
     def num_columns(self) -> int:

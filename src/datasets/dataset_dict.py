@@ -3,13 +3,18 @@ import copy
 import itertools
 import json
 import math
+import os
 import posixpath
 import random
 import re
 import time
 from collections.abc import Sequence
 from functools import partial
-from typing import Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Callable, Literal, Optional, Union
+
+
+if TYPE_CHECKING:
+    from .split_integrity import SplitIntegrityConfig
 
 import fsspec
 import numpy as np
@@ -66,6 +71,131 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
                 raise ValueError(
                     f"All datasets in `DatasetDict` should have the same features but features for '{item_a[0]}' and '{item_b[0]}' don't match: {item_a[1].features} != {item_b[1].features}"
                 )
+
+    def detect_overlap(
+        self,
+        id_columns: Union[str, list[str]] = "id",
+        chunk_size: int = 1000,
+        split_names: Optional[list[str]] = None,
+        max_reported_overlaps: int = 20,
+    ):
+        """Return an [`OverlapReport`] for sample identifiers shared across splits.
+
+        Detection compares identifiers, not whole-row content. Data is processed in
+        chunks and chunk boundaries are handled explicitly, so the conclusion is the same
+        for any `chunk_size`. Nothing is raised: inspect `report.has_overlap` and
+        `report.overlap_pairs`.
+        """
+        from .split_integrity import detect_split_overlap
+
+        return detect_split_overlap(
+            self,
+            id_columns=id_columns,
+            chunk_size=chunk_size,
+            split_names=split_names,
+            max_reported_overlaps=max_reported_overlaps,
+        )
+
+    def check_overlap(
+        self,
+        id_columns: Union[str, list[str]] = "id",
+        chunk_size: int = 1000,
+        split_names: Optional[list[str]] = None,
+        max_reported_overlaps: int = 20,
+    ):
+        """Like [`~DatasetDict.detect_overlap`] but raise [`SplitOverlapError`] on overlap.
+
+        The error message is the report summary: counts per split pair plus a capped
+        sample of identifiers. The full report is on `exc.report`.
+        """
+        from .exceptions import SplitOverlapError
+
+        report = self.detect_overlap(
+            id_columns=id_columns,
+            chunk_size=chunk_size,
+            split_names=split_names,
+            max_reported_overlaps=max_reported_overlaps,
+        )
+        if report.has_overlap:
+            raise SplitOverlapError(
+                "Split overlap detected: the same sample identifier appears in more than one split.\n"
+                + report.summary(),
+                report=report,
+            )
+        return report
+
+    def verify_splits(
+        self,
+        config: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
+        manifest: Optional[Union[str, dict]] = None,
+    ):
+        """Run the full opt-in split verification and return the manifest used.
+
+        Checks, in order: manifest presence (when `manifest` or the directory manifest
+        is used), per-split content fingerprints, required splits, and cross-split
+        overlap by sample identifier.
+
+        Args:
+            config (`bool`, `dict` or [`SplitIntegrityConfig`], *optional*): check
+                options. Defaults to the options recorded at load time, else
+                ``SplitIntegrityConfig(enabled=True)``.
+            manifest (`str`, `dict` or [`SplitManifest`], *optional*): verify against this
+                manifest instead of the one attached at load time.
+        """
+        from .split_integrity import (
+            SplitIntegrityConfig,
+            SplitManifest,
+            check_split_integrity,
+            verify_splits_against_manifest,
+        )
+
+        integrity_config = SplitIntegrityConfig.coerce(config if config is not None else True)
+        manifest = manifest if manifest is not None else getattr(self, "_split_integrity_manifest", None)
+        if manifest is not None:
+            manifest = verify_splits_against_manifest(
+                self, manifest, fail_on_missing_manifest=integrity_config.strict_missing_manifest
+            )
+        report, fingerprints = check_split_integrity(self, config=integrity_config)
+        if manifest is None:
+            manifest = SplitManifest.from_dict(
+                {
+                    "dataset_id": "unknown",
+                    "split_method": "as_provided",
+                    "id_columns": [integrity_config.id_columns]
+                    if isinstance(integrity_config.id_columns, str)
+                    else list(integrity_config.id_columns),
+                    "num_samples": {name: len(dataset) for name, dataset in self.items()},
+                    "fingerprints": fingerprints,
+                }
+            )
+        self._split_integrity_report = report
+        return manifest
+
+    def export_manifest(
+        self,
+        path,
+        dataset_id: Optional[str] = None,
+        revision: Optional[str] = None,
+        split_method: str = "as_provided",
+        seed: Optional[int] = None,
+        ratios: Optional[dict] = None,
+        id_columns: Union[str, list[str]] = "id",
+        include_sample_ids: bool = True,
+    ) -> str:
+        """Write a reproducible split manifest to `path` and return the written path."""
+        from .split_integrity import build_split_manifest
+
+        manifest = build_split_manifest(
+            self,
+            dataset_id=dataset_id,
+            revision=revision,
+            split_method=split_method,
+            seed=seed,
+            ratios=ratios,
+            id_columns=id_columns,
+            include_sample_ids=include_sample_ids,
+        )
+        return manifest.save(path)
 
     def __enter__(self):
         return self
@@ -1329,6 +1459,7 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
         num_shards: Optional[dict[str, int]] = None,
         num_proc: Optional[int] = None,
         storage_options: Optional[dict] = None,
+        split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     ):
         """
         Saves a dataset dict to a filesystem using `fsspec.spec.AbstractFileSystem`.
@@ -1360,6 +1491,17 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
                 Key/value pairs to be passed on to the file-system backend, if any.
 
                 <Added version="2.8.0"/>
+            split_integrity (`bool`, `dict` or [`SplitIntegrityConfig`], *optional*, defaults to `None`):
+                Opt-in content fingerprint manifest for the whole `DatasetDict`. When
+                enabled, a single `split_integrity.json` is written next to
+                `dataset_dict.json` with the per-split row counts, fingerprints and
+                (optionally) sample identifiers. Passing a mapping can additionally set
+                `seed`, `ratios`, `split_method` and `dataset_id` to describe a seeded
+                split. [`DatasetDict.load_from_disk`] then refuses to load if a split
+                was replaced or corrupted, and its `verify_splits()` helper can run the
+                overlap check.
+
+                <Added version="5.3.0"/>
 
         Example:
 
@@ -1367,6 +1509,7 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
         >>> dataset_dict.save_to_disk("path/to/dataset/directory")
         >>> dataset_dict.save_to_disk("path/to/dataset/directory", max_shard_size="1GB")
         >>> dataset_dict.save_to_disk("path/to/dataset/directory", num_shards={"train": 1024, "test": 8})
+        >>> dataset_dict.save_to_disk("path/to/dataset/directory", split_integrity=True)
         ```
         """
         fs: fsspec.AbstractFileSystem
@@ -1396,11 +1539,48 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
                 storage_options=storage_options,
             )
 
+        if split_integrity:
+            from .split_integrity import SplitIntegrityConfig, build_split_manifest
+
+            # Accept the same options as `Dataset.save_to_disk`, plus optional
+            # provenance fields that describe how the split was produced.
+            if isinstance(split_integrity, dict):
+                provenance = {
+                    key: split_integrity[key]
+                    for key in ("dataset_id", "revision", "split_method", "seed", "ratios", "extra")
+                    if key in split_integrity
+                }
+                config_options = {key: value for key, value in split_integrity.items() if key not in provenance}
+                integrity_config = SplitIntegrityConfig.coerce(config_options or True)
+            else:
+                provenance = {}
+                integrity_config = SplitIntegrityConfig.coerce(split_integrity)
+            files = {
+                name: [posixpath.join(name, posixpath.basename(path)) for path in fs.glob(posixpath.join(dataset_dict_path, name, "*.arrow"))] or [f"{name}/"]
+                for name in self
+            }
+            if provenance.get("dataset_id") is None:
+                provenance["dataset_id"] = os.path.basename(str(dataset_dict_path).rstrip("/"))
+            manifest = build_split_manifest(
+                dict(self),
+                id_columns=integrity_config.normalized_id_columns(),
+                include_sample_ids=integrity_config.include_sample_ids,
+                batch_size=integrity_config.batch_size,
+                num_proc=integrity_config.num_proc,
+                files=files,
+                **provenance,
+            )
+            with fs.open(
+                posixpath.join(dataset_dict_path, integrity_config.manifest_filename), "w", encoding="utf-8"
+            ) as f:
+                json.dump(manifest.to_dict(), f, indent=2, sort_keys=True)
+
     @staticmethod
     def load_from_disk(
         dataset_dict_path: PathLike,
         keep_in_memory: Optional[bool] = None,
         storage_options: Optional[dict] = None,
+        split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     ) -> "DatasetDict":
         """
         Load a dataset that was previously saved using [`save_to_disk`] from a filesystem using `fsspec.spec.AbstractFileSystem`.
@@ -1418,6 +1598,14 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
                 Key/value pairs to be passed on to the file-system backend, if any.
 
                 <Added version="2.8.0"/>
+            split_integrity (`bool`, `dict` or [`SplitIntegrityConfig`], *optional*, defaults to `None`):
+                Opt-in verification against the `split_integrity.json` written by
+                [`DatasetDict.save_to_disk`]. When enabled, every split is re-fingerprinted
+                and the load is refused with a [`FingerprintMismatchError`] naming the
+                inconsistent files if the data doesn't match. The loaded splits also get a
+                `verify_splits()` helper to re-run the overlap check.
+
+                <Added version="5.3.0"/>
 
         Returns:
             [`DatasetDict`]
@@ -1426,6 +1614,7 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
 
         ```py
         >>> ds = load_from_disk('path/to/dataset/directory')
+        >>> ds = load_from_disk('path/to/dataset/directory', split_integrity=True)
         ```
         """
         fs: fsspec.AbstractFileSystem
@@ -1449,11 +1638,58 @@ class DatasetDict(dict[Union[str, NamedSplit], "Dataset"]):
         dataset_dict = DatasetDict()
         for k in splits:
             dataset_dict_split_path = posixpath.join(fs.unstrip_protocol(dataset_dict_path), k)
-            dataset_dict[k] = Dataset.load_from_disk(
-                dataset_dict_split_path,
-                keep_in_memory=keep_in_memory,
-                storage_options=storage_options,
+            try:
+                dataset_dict[k] = Dataset.load_from_disk(
+                    dataset_dict_split_path,
+                    keep_in_memory=keep_in_memory,
+                    storage_options=storage_options,
+                )
+            except Exception as e:
+                # With integrity checking on, an unreadable cache file is corruption,
+                # not a programming error: report it with the offending file.
+                if not split_integrity:
+                    raise
+                from .exceptions import FingerprintMismatchError
+
+                arrow_files = fs.glob(posixpath.join(dataset_dict_path, k, "*.arrow"))
+                raise FingerprintMismatchError(
+                    f"Split '{k}' could not be read from {dataset_dict_split_path}: {type(e).__name__}: {e}. "
+                    f"The cache file(s) were replaced or corrupted. Checked files: {arrow_files}."
+                ) from e
+
+        if split_integrity:
+            from .split_integrity import (
+                SplitIntegrityConfig,
+                SplitManifest,
+                attach_manifest_metadata,
+                check_split_integrity,
             )
+
+            integrity_config = SplitIntegrityConfig.coerce(split_integrity)
+            manifest_path = posixpath.join(
+                fs.unstrip_protocol(dataset_dict_path), integrity_config.manifest_filename
+            )
+            if not fs.isfile(manifest_path):
+                if integrity_config.strict_missing_manifest:
+                    from .exceptions import SplitManifestError
+
+                    raise SplitManifestError(
+                        f"No split integrity manifest found at {manifest_path}. "
+                        "Save the dataset with `save_to_disk(..., split_integrity=True)` or pass "
+                        "`split_integrity={'strict_missing_manifest': False}` to load without verification."
+                    )
+            else:
+                with fs.open(manifest_path, encoding="utf-8") as manifest_file:
+                    manifest = SplitManifest.from_dict(json.load(manifest_file))
+                if integrity_config.verify_on_load:
+                    manifest.verify(dataset_dict)
+                for name, dataset in dataset_dict.items():
+                    attach_manifest_metadata(dataset, manifest, split_name=name)
+                dataset_dict._split_integrity_manifest = manifest
+                if integrity_config.check_overlap_on_load:
+                    report, _ = check_split_integrity(dataset_dict, config=integrity_config)
+                    dataset_dict._split_integrity_report = report
+
         return dataset_dict
 
     @staticmethod

@@ -38,6 +38,36 @@
 
 [[autodoc]] datasets.ReadInstruction
 
+## Split integrity
+
+Opt-in split provenance, seeded replay, cross-split overlap detection and cache
+fingerprint verification. All of it is disabled unless a `split_integrity` keyword
+argument is passed or one of these helpers is called directly.
+
+[[autodoc]] datasets.SplitIntegrityConfig
+
+[[autodoc]] datasets.SplitManifest
+
+[[autodoc]] datasets.OverlapReport
+
+[[autodoc]] datasets.SplitAssignment
+
+[[autodoc]] datasets.compute_content_fingerprint
+
+[[autodoc]] datasets.compute_sample_identifiers
+
+[[autodoc]] datasets.assign_splits
+
+[[autodoc]] datasets.split_by_seed
+
+[[autodoc]] datasets.detect_split_overlap
+
+[[autodoc]] datasets.where_is_sample
+
+[[autodoc]] datasets.check_split_integrity
+
+[[autodoc]] datasets.build_split_manifest
+
 ## Version
 
 [[autodoc]] datasets.utils.Version

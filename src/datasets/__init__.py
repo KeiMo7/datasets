@@ -32,6 +32,21 @@ from .inspect import (
 )
 from .iterable_dataset import IterableColumn, IterableDataset
 from .load import load_dataset, load_dataset_builder, load_from_disk
+from .split_integrity import (
+    ContentFingerprint,
+    OverlapReport,
+    SplitAssignment,
+    SplitIntegrityConfig,
+    SplitManifest,
+    assign_splits,
+    build_split_manifest,
+    check_split_integrity,
+    compute_content_fingerprint,
+    compute_sample_identifiers,
+    detect_split_overlap,
+    split_by_seed,
+    where_is_sample,
+)
 from .splits import (
     NamedSplit,
     NamedSplitAll,

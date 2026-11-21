@@ -25,7 +25,11 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional, Union, overload
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union, overload
+
+
+if TYPE_CHECKING:
+    from .split_integrity import SplitIntegrityConfig
 
 import fsspec
 import yaml
@@ -1367,6 +1371,7 @@ def load_dataset(
     streaming: Literal[False] = False,
     num_proc: Optional[int] = None,
     storage_options: Optional[dict] = None,
+    split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     **config_kwargs: Any,
 ) -> DatasetDict: ...
 
@@ -1391,6 +1396,7 @@ def load_dataset(
     streaming: Literal[False] = False,
     num_proc: Optional[int] = None,
     storage_options: Optional[dict] = None,
+    split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     **config_kwargs: Any,
 ) -> Dataset: ...
 
@@ -1415,6 +1421,7 @@ def load_dataset(
     streaming: Literal[True],
     num_proc: Optional[int] = None,
     storage_options: Optional[dict] = None,
+    split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     **config_kwargs: Any,
 ) -> IterableDatasetDict: ...
 
@@ -1439,6 +1446,7 @@ def load_dataset(
     streaming: Literal[True],
     num_proc: Optional[int] = None,
     storage_options: Optional[dict] = None,
+    split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     **config_kwargs: Any,
 ) -> IterableDataset: ...
 
@@ -1461,6 +1469,7 @@ def load_dataset(
     streaming: bool = False,
     num_proc: Optional[int] = None,
     storage_options: Optional[dict] = None,
+    split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
     **config_kwargs,
 ) -> Union[DatasetDict, Dataset, IterableDatasetDict, IterableDataset]:
     """Load a dataset from the Hugging Face Hub, or a local dataset.
@@ -1570,6 +1579,16 @@ def load_dataset(
             **Experimental**. Key/value pairs to be passed on to the dataset file-system backend, if any.
 
             <Added version="2.11.0"/>
+        split_integrity (`bool`, `dict` or [`SplitIntegrityConfig`], *optional*, defaults to `None`):
+            Opt-in split provenance and verification. When enabled (or when a mapping /
+            config is passed), `load_dataset` records for every loaded split its content
+            fingerprint, row count, split method and identifier columns; checks that the
+            required splits are present; checks that the splits don't share sample
+            identifiers; and writes/verifies a `split_integrity.json` manifest in the
+            builder cache directory. Pass `{"manifest_path": "..."}` to also export the
+            manifest. A plain `None` (default) keeps the historical behaviour exactly.
+
+            <Added version="5.3.0"/>
         **config_kwargs (additional keyword arguments):
             Keyword arguments to be passed to the `BuilderConfig`
             and used in the [`DatasetBuilder`].
@@ -1681,6 +1700,12 @@ def load_dataset(
 
     # Return iterable dataset in case of streaming
     if streaming:
+        if split_integrity:
+            raise ValueError(
+                "`split_integrity` requires materialised splits: streaming datasets are not cached, "
+                "have no content fingerprint and cannot be checked for cross-split overlap. "
+                "Load without `streaming=True` (or without `split_integrity`) instead."
+            )
         return builder_instance.as_streaming_dataset(split=split)
 
     # Download and prepare data
@@ -1698,11 +1723,108 @@ def load_dataset(
     )
     ds = builder_instance.as_dataset(split=split, in_memory=keep_in_memory)
 
+    if split_integrity:
+        ds = _apply_split_integrity(
+            ds,
+            builder=builder_instance,
+            path=path,
+            name=name,
+            revision=revision,
+            split_integrity=split_integrity,
+        )
+
+    return ds
+
+
+def _apply_split_integrity(
+    ds: Union[Dataset, DatasetDict],
+    builder: DatasetBuilder,
+    path: str,
+    name: Optional[str],
+    revision: Optional[Union[str, Version]],
+    split_integrity: Union[bool, dict, "SplitIntegrityConfig"],
+) -> Union[Dataset, DatasetDict]:
+    """Opt-in: fingerprint the freshly loaded splits, check them and record a manifest.
+
+    Only called when `split_integrity` is truthy, so the default path is untouched.
+    """
+    from .split_integrity import (
+        SplitIntegrityConfig,
+        SplitManifest,
+        attach_manifest_metadata,
+        build_split_manifest,
+        check_split_integrity,
+        find_manifest_path,
+        load_manifest_from_directory,
+    )
+
+    integrity_config = SplitIntegrityConfig.coerce(split_integrity)
+    dataset_dict = ds if isinstance(ds, DatasetDict) else DatasetDict({str(ds.split or "train"): ds})
+    split_names = list(dataset_dict)
+    missing = [split_name for split_name in (integrity_config.required_splits or []) if split_name not in dataset_dict]
+    if missing:
+        from .exceptions import MissingSplitError
+
+        raise MissingSplitError(
+            f"Required split(s) {missing} are missing from dataset '{path}'. "
+            f"Available splits: {split_names}."
+        )
+
+    # The cache directory contains one Arrow file per split; record their names for
+    # diagnostics only - fingerprints are always computed from the values themselves.
+    files = {split_name: split._split_cache_files() for split_name, split in dataset_dict.items()}
+    manifest = build_split_manifest(
+        dataset_dict,
+        dataset_id=str(path),
+        revision=str(revision) if revision is not None else None,
+        split_method="as_provided",
+        seed=None,
+        ratios=None,
+        id_columns=integrity_config.normalized_id_columns(),
+        include_sample_ids=integrity_config.include_sample_ids,
+        batch_size=integrity_config.batch_size,
+        num_proc=integrity_config.num_proc,
+        files=files,
+        extra={"config_name": name},
+    )
+
+    # Record / verify the manifest in the builder cache directory. This is only done for
+    # local caches: writing a sidecar into a remote builder cache would need a dedicated
+    # upload path, so remote users should pass `manifest_path` explicitly.
+    cache_dir = getattr(builder, "cache_dir", None)
+    local_cache_dir = cache_dir if cache_dir and os.path.isdir(cache_dir) else None
+    cache_manifest_path = (
+        find_manifest_path(local_cache_dir, integrity_config.manifest_filename) if local_cache_dir else None
+    )
+    if cache_manifest_path is not None and integrity_config.verify_on_load:
+        cached = load_manifest_from_directory(
+            local_cache_dir, manifest_filename=integrity_config.manifest_filename, fail_on_missing_manifest=False
+        )
+        if cached is not None:
+            cached.verify(dataset_dict)
+    elif local_cache_dir and integrity_config.record_cache_manifest:
+        cache_manifest = SplitManifest.from_dict(manifest.to_dict())
+        cache_manifest.save(local_cache_dir)
+
+    report, _ = check_split_integrity(dataset_dict, config=integrity_config)
+    for split_name, split in dataset_dict.items():
+        attach_manifest_metadata(split, manifest, split_name=split_name)
+    ds._split_integrity_manifest = manifest
+    ds._split_integrity_report = report
+
+    if integrity_config.manifest_path:
+        manifest.save(integrity_config.manifest_path)
+    elif local_cache_dir and integrity_config.record_cache_manifest and cache_manifest_path is None:
+        manifest.save(local_cache_dir)
+
     return ds
 
 
 def load_from_disk(
-    dataset_path: PathLike, keep_in_memory: Optional[bool] = None, storage_options: Optional[dict] = None
+    dataset_path: PathLike,
+    keep_in_memory: Optional[bool] = None,
+    storage_options: Optional[dict] = None,
+    split_integrity: Optional[Union[bool, dict, "SplitIntegrityConfig"]] = None,
 ) -> Union[Dataset, DatasetDict]:
     """
     Loads a dataset that was previously saved using [`~Dataset.save_to_disk`] from a dataset directory, or
@@ -1722,6 +1844,12 @@ def load_from_disk(
             Key/value pairs to be passed on to the file-system backend, if any.
 
             <Added version="2.9.0"/>
+        split_integrity (`bool`, `dict` or [`SplitIntegrityConfig`], *optional*, defaults to `None`):
+            Opt-in verification against the `split_integrity.json` manifest saved next to
+            the dataset. When enabled, the loaded data is re-fingerprinted and the load
+            is refused if a cache file was replaced or corrupted.
+
+            <Added version="5.3.0"/>
 
     Returns:
         [`Dataset`] or [`DatasetDict`]:
@@ -1733,6 +1861,7 @@ def load_from_disk(
     ```py
     >>> from datasets import load_from_disk
     >>> ds = load_from_disk('path/to/dataset/directory')
+    >>> ds = load_from_disk('path/to/dataset/directory', split_integrity=True)
     ```
     """
     fs: fsspec.AbstractFileSystem
@@ -1742,9 +1871,19 @@ def load_from_disk(
     if fs.isfile(posixpath.join(dataset_path, config.DATASET_INFO_FILENAME)) and fs.isfile(
         posixpath.join(dataset_path, config.DATASET_STATE_JSON_FILENAME)
     ):
-        return Dataset.load_from_disk(dataset_path, keep_in_memory=keep_in_memory, storage_options=storage_options)
+        return Dataset.load_from_disk(
+            dataset_path,
+            keep_in_memory=keep_in_memory,
+            storage_options=storage_options,
+            split_integrity=split_integrity,
+        )
     elif fs.isfile(posixpath.join(dataset_path, config.DATASETDICT_JSON_FILENAME)):
-        return DatasetDict.load_from_disk(dataset_path, keep_in_memory=keep_in_memory, storage_options=storage_options)
+        return DatasetDict.load_from_disk(
+            dataset_path,
+            keep_in_memory=keep_in_memory,
+            storage_options=storage_options,
+            split_integrity=split_integrity,
+        )
     else:
         raise FileNotFoundError(
             f"Directory {dataset_path} is neither a `Dataset` directory nor a `DatasetDict` directory."

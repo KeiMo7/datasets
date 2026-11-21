@@ -34,6 +34,33 @@ class DatasetNotFoundError(FileNotFoundDatasetsError):
     """
 
 
+class SplitIntegrityError(DatasetsError):
+    """Base class for split-provenance and cache-integrity errors."""
+
+
+class SplitManifestError(SplitIntegrityError):
+    """The split manifest is missing, malformed, or cannot be used."""
+
+
+class MissingSplitError(SplitIntegrityError):
+    """A required dataset split is missing."""
+
+
+class FingerprintMismatchError(SplitIntegrityError):
+    """The loaded data doesn't match the fingerprint recorded for it."""
+
+
+class SplitOverlapError(SplitIntegrityError):
+    """Samples were found in more than one split.
+
+    The full machine-readable report is available as ``self.report``.
+    """
+
+    def __init__(self, message: str, report=None):
+        super().__init__(message)
+        self.report = report
+
+
 class DatasetBuildError(DatasetsError):
     pass
 

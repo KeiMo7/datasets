@@ -37,6 +37,8 @@ The base class [`Dataset`] implements a Dataset backed by an Apache Arrow table.
     - __len__
     - __iter__
     - iter
+    - content_fingerprint
+    - sample_identifiers
     - formatted_as
     - set_format
     - set_transform
@@ -151,6 +153,10 @@ It also has dataset transform methods like map or filter, to process all the spl
     - push_to_hub
     - save_to_disk
     - load_from_disk
+    - detect_overlap
+    - check_overlap
+    - verify_splits
+    - export_manifest
     - from_csv
     - from_json
     - from_parquet

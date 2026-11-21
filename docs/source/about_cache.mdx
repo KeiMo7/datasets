@@ -47,3 +47,29 @@ The pickler recursively dumps all the variables used in your function, so any ch
 If one of your functions doesn't seem to have the same hash across sessions, it means at least one of its variables contains a Python object that is not deterministic.
 When this happens, feel free to hash any object you find suspicious to try to find the object that caused the hash to change.
 For example, if you use a list for which the order of its elements is not deterministic across sessions, then the hash won't be the same across sessions either.
+
+## Split integrity
+
+The cache fingerprint above answers "can this cache file be reused?" and it includes
+the cache files' modification times. To answer a different question - "is this exactly
+the data my experiment was split and evaluated on?" - use the opt-in split integrity
+checks. They are disabled by default and enabled with a `split_integrity` keyword.
+
+```py
+>>> from datasets import load_dataset, load_from_disk
+
+# Record per-split content fingerprints and a manifest when saving
+>>> dataset_dict.save_to_disk("exp/dataset", split_integrity={"seed": 42, "split_method": "seeded"})
+
+# Refuse to load if a cache file was replaced or corrupted
+>>> dataset_dict = load_from_disk("exp/dataset", split_integrity=True)
+
+# Check that train / validation / test share no sample identifiers
+>>> report = dataset_dict.detect_overlap(id_columns="id")
+>>> report.has_overlap, report.overlap_pairs
+```
+
+The content fingerprint hashes the values and their order, never the file names,
+sizes or modification times. See [`~datasets.SplitManifest`],
+[`~datasets.SplitIntegrityConfig`] and [`~datasets.detect_split_overlap`] for the full
+API, and [`~datasets.split_by_seed`] for reproducible seed-based splits.
