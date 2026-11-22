@@ -91,7 +91,6 @@ from .features import Audio, ClassLabel, Features, Image, List, Value, Video
 from .features.features import (
     FeatureType,
     _align_features,
-    _check_if_features_can_be_aligned,
     _fix_for_backward_compatible_features,
     generate_from_arrow_type,
     pandas_types_mapper,
@@ -158,6 +157,7 @@ if TYPE_CHECKING:
 
     from .dataset_dict import DatasetDict
     from .iterable_dataset import IterableDataset
+    from .merge import MergeReport, MergeStrategy
 
 logger = logging.get_logger(__name__)
 
@@ -740,6 +740,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         split: Optional[NamedSplit] = None,
         indices_table: Optional[Table] = None,
         fingerprint: Optional[str] = None,
+        merge_report: Optional["MergeReport"] = None,
     ):
         info = info.copy() if info is not None else DatasetInfo()
         DatasetInfoMixin.__init__(self, info=info, split=split)
@@ -754,6 +755,9 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         self._format_columns: Optional[list] = None
         self._output_all_columns: bool = False
         self._fingerprint: str = fingerprint
+        # Report of the schema unification that produced this dataset, if it was
+        # created by concatenating heterogeneous shards. None otherwise.
+        self._merge_report = merge_report
 
         # Read metadata
 
@@ -2219,6 +2223,18 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         ```
         """
         return self._data.column_names
+
+    @property
+    def merge_report(self) -> Optional["MergeReport"]:
+        """[`datasets.merge.MergeReport`] of the schema unification, if any.
+
+        Set when the dataset was created by concatenating shards with
+        heterogeneous features. It records every per-column type promotion,
+        whether it is lossy and how class dictionaries were merged, so each
+        implicit conversion remains auditable. `None` for datasets that didn't
+        result from such a merge.
+        """
+        return self._merge_report
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -7727,10 +7743,17 @@ def _concatenate_map_style_datasets(
     info: Optional[DatasetInfo] = None,
     split: Optional[NamedSplit] = None,
     axis: int = 0,
+    merge_strategy: Optional["MergeStrategy"] = None,
 ):
     """
     Converts a list of :class:`Dataset` with the same schema into a single :class:`Dataset`.
     When you concatenate on axis 0, missing data are filled with None values.
+
+    When shards have heterogeneous (but compatible) features, they are unified
+    through :func:`datasets.merge.unify_features`. Every implicit promotion is
+    described by the returned dataset's `merge_report`
+    (:class:`datasets.merge.MergeReport`); a :class:`datasets.merge.MergeError`
+    is raised when the shards can't be merged under the given `merge_strategy`.
 
     Args:
         dsets (`List[datasets.Dataset]`): List of Datasets to concatenate.
@@ -7741,6 +7764,9 @@ def _concatenate_map_style_datasets(
             (horizontally).
 
             *New in version 1.6.0*
+        merge_strategy (:class:`datasets.merge.MergeStrategy`, *optional*):
+            Strategy controlling which type promotions are allowed. Defaults to a
+            lossless-only strategy.
 
     Example:
 
@@ -7748,6 +7774,10 @@ def _concatenate_map_style_datasets(
     >>> ds3 = _concatenate_map_style_datasets([ds1, ds2])
     ```
     """
+    from .merge import DEFAULT_MERGE_STRATEGY, unify_features, unify_table
+
+    if merge_strategy is None:
+        merge_strategy = DEFAULT_MERGE_STRATEGY
     # Ignore datasets with no rows
     if any(dset.num_rows > 0 for dset in dsets):
         dsets = [dset for dset in dsets if dset.num_rows > 0]
@@ -7756,8 +7786,35 @@ def _concatenate_map_style_datasets(
         return dsets[0]
 
     # Perform checks (and a potential cast if axis=0)
+    unified_features = None
+    merge_report = None
     if axis == 0:
-        _check_if_features_can_be_aligned([dset.features for dset in dsets])
+        # Unify the features of all the shards first: this validates
+        # compatibility under the merge strategy and produces an auditable
+        # promotion report. Identical schemas pass through unchanged.
+        unified_features, merge_report = unify_features(
+            [dset.features for dset in dsets], merge_strategy
+        )
+        if merge_report.has_promotions:
+            # Cast each shard to the unified schema independently so the data of
+            # a shard is only read once and never all held together in memory.
+            # Memory-mapped shards keep the conversion as a lazy replay (the
+            # arrow file stays on disk); in-memory shards are cast directly.
+            casted_dsets = []
+            for index, dset in enumerate(dsets):
+                if dset.features == unified_features:
+                    casted_dsets.append(dset)
+                    continue
+                casted_info = dset.info.copy()
+                casted_info.features = unified_features
+                if isinstance(dset._data, MemoryMappedTable):
+                    casted_table = dset._data.merge_unify(index, unified_features, merge_report)
+                else:
+                    casted_table = InMemoryTable(
+                        unify_table(dset._data.table, index, unified_features, merge_report)
+                    )
+                casted_dsets.append(Dataset(casted_table, info=casted_info, split=dset.split))
+            dsets = casted_dsets
     else:
         if not all(dset.num_rows == dsets[0].num_rows for dset in dsets):
             raise ValueError("Number of rows must match for all datasets")
@@ -7812,18 +7869,35 @@ def _concatenate_map_style_datasets(
 
     table = concat_tables([dset._data for dset in dsets], axis=axis)
     if axis == 0:
-        features_list = _align_features([dset.features for dset in dsets])
+        # After casting, every shard already shares the unified schema.
+        features_list = [unified_features] * len(dsets)
+        merged_features = unified_features
     else:
         features_list = [dset.features for dset in dsets]
-    table = update_metadata_with_features(table, {k: v for features in features_list for k, v in features.items()})
+        merged_features = Features({k: v for features in features_list for k, v in features.items()})
+    table = update_metadata_with_features(table, merged_features)
 
     # Concatenate infos
     if info is None:
         info = DatasetInfo.from_merge([dset.info for dset in dsets])
+    else:
+        info = info.copy()
+    if axis == 0:
+        # Record the unification result so the implicit promotions stay auditable.
+        info.features = merged_features
+    from .merge import merge_strategy_fingerprint
+
     fingerprint = update_fingerprint(
         "".join(dset._fingerprint for dset in dsets),
         _concatenate_map_style_datasets,
-        {"info": info, "split": split, "axis": axis},
+        {
+            "info": info,
+            "split": split,
+            "axis": axis,
+            # The cache identifier changes with the merge strategy so a result
+            # computed under a different strategy is never read back.
+            "merge_strategy": merge_strategy_fingerprint(merge_strategy) if axis == 0 else None,
+        },
     )
 
     # Make final concatenated dataset
@@ -7833,6 +7907,7 @@ def _concatenate_map_style_datasets(
         split=split,
         indices_table=indices_table,
         fingerprint=fingerprint,
+        merge_report=merge_report,
     )
     concatenated_dataset.set_format(**format)
     return concatenated_dataset

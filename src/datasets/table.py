@@ -1111,6 +1111,12 @@ class MemoryMappedTable(TableBlock):
                     table = table_cast(table, *args, **kwargs)
                 elif name == "flatten":
                     table = table_flatten(table, *args, **kwargs)
+                elif name == "merge_unify":
+                    from .merge import unify_table
+
+                    # args = (shard_index, unified_features, merge_report)
+                    shard_index, unified_features, merge_report = args
+                    table = unify_table(table, shard_index, unified_features, merge_report)
                 else:
                     table = getattr(table, name)(*args, **kwargs)
         return table
@@ -1197,6 +1203,26 @@ class MemoryMappedTable(TableBlock):
         replay = ("cast", copy.deepcopy(args), copy.deepcopy(kwargs))
         replays = self._append_replay(replay)
         return MemoryMappedTable(table_cast(self.table, *args, **kwargs), self.path, replays)
+
+    def merge_unify(self, shard_index: int, unified_features, merge_report):
+        """Lazily unify the table schema for a shard merge.
+
+        Like [`MemoryMappedTable.cast`], the conversion is recorded as a replay so
+        the underlying arrow file stays on disk and the table is not loaded into
+        memory; the unification is re-applied when the table is reloaded or
+        un-pickled. The arguments are pickled alongside the path.
+        """
+        from .merge import unify_table
+
+        replay = (
+            "merge_unify",
+            (copy.deepcopy(shard_index), copy.deepcopy(unified_features), copy.deepcopy(merge_report)),
+            {},
+        )
+        replays = self._append_replay(replay)
+        return MemoryMappedTable(
+            unify_table(self.table, shard_index, unified_features, merge_report), self.path, replays
+        )
 
     def replace_schema_metadata(self, *args, **kwargs):
         """

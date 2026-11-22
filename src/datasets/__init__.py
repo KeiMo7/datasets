@@ -32,6 +32,15 @@ from .inspect import (
 )
 from .iterable_dataset import IterableColumn, IterableDataset
 from .load import load_dataset, load_dataset_builder, load_from_disk
+from .merge import (
+    ColumnMergeReport,
+    MergeError,
+    MergeReport,
+    MergeStrategy,
+    merge_strategy_fingerprint,
+    unify_features,
+    unify_table,
+)
 from .splits import (
     NamedSplit,
     NamedSplitAll,

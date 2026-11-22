@@ -1,4 +1,4 @@
-from typing import Optional, TypeVar
+from typing import TYPE_CHECKING, Optional, TypeVar
 
 from .arrow_dataset import Dataset, _concatenate_map_style_datasets, _interleave_map_style_datasets
 from .dataset_dict import DatasetDict, IterableDatasetDict
@@ -7,6 +7,10 @@ from .iterable_dataset import IterableDataset, _concatenate_iterable_datasets, _
 from .splits import NamedSplit
 from .utils import logging
 from .utils.py_utils import Literal
+
+
+if TYPE_CHECKING:
+    from .merge import MergeStrategy
 
 
 logger = logging.get_logger(__name__)
@@ -170,11 +174,20 @@ def concatenate_datasets(
     info: Optional[DatasetInfo] = None,
     split: Optional[NamedSplit] = None,
     axis: int = 0,
+    merge_strategy: Optional["MergeStrategy"] = None,
 ) -> DatasetType:
     """
     Concatenate several datasets (sources) into a single dataset.
 
     Use axis=0 to concatenate vertically (default), or axis=1 to concatenate horizontally.
+
+    Shards with heterogeneous but compatible features are unified automatically.
+    The resulting dataset exposes a `merge_report` describing every per-column
+    type promotion (and whether it is lossy). Pass a
+    [`datasets.merge.MergeStrategy`] to control which promotions are allowed; by
+    default only lossless promotions are permitted and missing columns are
+    null-filled. Incompatible shards raise a [`datasets.merge.MergeError`]
+    naming the offending column and the conflicting types.
 
     Note for iterable datasets:
 
@@ -195,6 +208,12 @@ def concatenate_datasets(
             (horizontally).
 
             <Added version="1.6.0"/>
+        merge_strategy ([`datasets.merge.MergeStrategy`], *optional*):
+            Strategy controlling which type promotions are allowed when shards
+            have heterogeneous features. Defaults to a lossless-only strategy
+            that fills missing columns with null.
+
+            <Added version="5.2.0"/>
 
     Example:
 
@@ -229,6 +248,12 @@ def concatenate_datasets(
                 f"Unable to interleave a {dataset_type.__name__} (at position 0) with a {other_type.__name__} (at position {i}). Expected a list of Dataset objects or a list of IterableDataset objects."
             )
     if dataset_type is Dataset:
-        return _concatenate_map_style_datasets(dsets, info=info, split=split, axis=axis)
+        return _concatenate_map_style_datasets(dsets, info=info, split=split, axis=axis, merge_strategy=merge_strategy)
     else:
-        return _concatenate_iterable_datasets(dsets, info=info, split=split, axis=axis)
+        return _concatenate_iterable_datasets(
+            dsets,
+            info=info,
+            split=split,
+            axis=axis,
+            merge_strategy=merge_strategy,
+        )

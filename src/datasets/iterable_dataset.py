@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     import torch
 
     from .builder import Key as BuilderKey
+    from .merge import MergeReport, MergeStrategy
 
 logger = get_logger(__name__)
 
@@ -715,6 +716,96 @@ class SelectColumnsIterable(_BaseExamplesIterable):
 
     def reshard_data_sources(self) -> "SelectColumnsIterable":
         return SelectColumnsIterable(self.ex_iterable.reshard_data_sources(), self.column_names)
+
+    @property
+    def num_shards(self) -> int:
+        return self.ex_iterable.num_shards
+
+
+class SchemaUnifyingExamplesIterable(_BaseExamplesIterable):
+    """Lazily cast the arrow batches (or rows) of one shard to the unified schema.
+
+    It is the streaming counterpart of :func:`datasets.merge.unify_table`: the
+    schema unification is decided up-front, but the actual casting is applied one
+    batch at a time as data is streamed, so a shard is never fully loaded into
+    memory. Missing columns are null-filled and class labels are re-indexed so
+    label texts stay identical row by row.
+    """
+
+    def __init__(
+        self,
+        ex_iterable: _BaseExamplesIterable,
+        shard_index: int,
+        unified_features: Features,
+        merge_report: "MergeReport",
+    ):
+        super().__init__()
+        self.ex_iterable = ex_iterable
+        self.shard_index = shard_index
+        self.unified_features = unified_features
+        self.merge_report = merge_report
+
+    @property
+    def iter_arrow(self):
+        return self._iter_arrow if self.ex_iterable.iter_arrow else None
+
+    @property
+    def is_typed(self):
+        # The cast output always carries the unified (typed) schema.
+        return True
+
+    @property
+    def features(self):
+        return self.unified_features
+
+    def _init_state_dict(self) -> dict:
+        self._state_dict = self.ex_iterable._init_state_dict()
+        return self._state_dict
+
+    def _iter_arrow(self) -> Iterator[tuple[Key, pa.Table]]:
+        from .merge import unify_table
+
+        for key, pa_table in self.ex_iterable.iter_arrow():
+            if len(pa_table) == 0:
+                yield key, pa.Table.from_batches([], schema=self.unified_features.arrow_schema)
+            else:
+                yield key, unify_table(pa_table, self.shard_index, self.unified_features, self.merge_report)
+
+    def __iter__(self):
+        from .merge import unify_example
+
+        # Fallback for sources that don't provide arrow batches: re-index class
+        # labels and null-fill missing columns row by row, then encode the row
+        # through the unified features (same safe-cast semantics as the arrow
+        # path, applied lazily one example at a time).
+        for key, example in self.ex_iterable:
+            unified_example = unify_example(example, self.shard_index, self.unified_features, self.merge_report)
+            encoded = self.unified_features.encode_example(unified_example)
+            yield key, encoded
+
+    def shuffle_data_sources(self, generator: np.random.Generator) -> "SchemaUnifyingExamplesIterable":
+        return SchemaUnifyingExamplesIterable(
+            self.ex_iterable.shuffle_data_sources(generator),
+            shard_index=self.shard_index,
+            unified_features=self.unified_features,
+            merge_report=self.merge_report,
+        )
+
+    def shard_data_sources(self, num_shards: int, index: int, contiguous=True) -> "SchemaUnifyingExamplesIterable":
+        return SchemaUnifyingExamplesIterable(
+            self.ex_iterable.shard_data_sources(num_shards, index, contiguous=contiguous),
+            shard_index=self.shard_index,
+            unified_features=self.unified_features,
+            merge_report=self.merge_report,
+        )
+
+    def reshard_data_sources(self) -> "SchemaUnifyingExamplesIterable":
+        return SchemaUnifyingExamplesIterable(
+            self.ex_iterable.reshard_data_sources(),
+            shard_index=self.shard_index,
+            unified_features=self.unified_features,
+            merge_report=self.merge_report,
+        )
 
     @property
     def num_shards(self) -> int:
@@ -2717,6 +2808,7 @@ class IterableDataset(DatasetInfoMixin):
         formatting: Optional[FormattingConfig] = None,
         distributed: Optional[DistributedConfig] = None,
         token_per_repo_id: Optional[dict[str, Union[str, bool, None]]] = None,
+        merge_report: Optional["MergeReport"] = None,
     ):
         info = info.copy() if info is not None else DatasetInfo()
         DatasetInfoMixin.__init__(self, info=info, split=split)
@@ -2725,6 +2817,7 @@ class IterableDataset(DatasetInfoMixin):
         self._formatting = formatting
         self._distributed = distributed
         self._token_per_repo_id: dict[str, Union[str, bool, None]] = token_per_repo_id or {}
+        self._merge_report = merge_report
         self._epoch: Union[int, "torch.Tensor"] = _maybe_share_with_torch_persistent_workers(0)
         self._starting_state_dict: Optional[dict] = None
         self.__hffs_cache = HfFileSystem._cache  # keep the cache on pickling (e.g. for dataloader workers)
@@ -2762,6 +2855,15 @@ class IterableDataset(DatasetInfoMixin):
         ```
         """
         return None if self.features is None else list(self.features)
+
+    @property
+    def merge_report(self) -> Optional["MergeReport"]:
+        """[`datasets.merge.MergeReport`] of the schema unification, if any.
+
+        Set when the streaming dataset was created by concatenating shards with
+        heterogeneous features. `None` otherwise.
+        """
+        return self._merge_report
 
     def state_dict(self) -> dict:
         """Get the current state_dict of the dataset.
@@ -5566,10 +5668,18 @@ def _concatenate_iterable_datasets(
     info: Optional[DatasetInfo] = None,
     split: Optional[NamedSplit] = None,
     axis: int = 0,
+    merge_strategy: Optional["MergeStrategy"] = None,
 ) -> IterableDataset:
     """
     Converts a list of `IterableDataset` with the same schema into a single `IterableDataset`.
     Missing data are filled with None values.
+
+    When shards have heterogeneous (but compatible) features, they are unified
+    through :func:`datasets.merge.unify_features`. The unification is schema-only
+    and happens up-front, while the per-shard casting (including class label
+    re-indexing and null-filling of missing columns) is applied lazily, batch by
+    batch, as the resulting dataset is streamed — shards are never fully loaded
+    into memory.
 
     <Added version="2.4.0"/>
 
@@ -5582,6 +5692,9 @@ def _concatenate_iterable_datasets(
             (horizontally).
 
             *New in version 1.6.0*
+        merge_strategy (:class:`datasets.merge.MergeStrategy`, *optional*):
+            Strategy controlling which type promotions are allowed. Defaults to a
+            lossless-only strategy.
 
     Example:
 
@@ -5589,13 +5702,20 @@ def _concatenate_iterable_datasets(
     >>> ds3 = _concatenate_iterable_datasets([ds1, ds2])
     ```
     """
+    from .merge import DEFAULT_MERGE_STRATEGY, unify_features
+
+    if merge_strategy is None:
+        merge_strategy = DEFAULT_MERGE_STRATEGY
     dsets = [d._resolve_features() for d in dsets]
 
     # Perform checks (and a potentional cast if axis=0)
     if axis == 0:
-        _check_if_features_can_be_aligned([dset.features for dset in dsets])
+        # Single source of truth for the schema unification, shared with the
+        # map-style path so both concatenations have identical semantics.
+        features, merge_report = unify_features([dset.features for dset in dsets], merge_strategy)
     else:
         _check_column_names([col_name for dset in dsets for col_name in dset.features])
+        merge_report = None
     for i, dset in enumerate(dsets):
         if dsets[0]._distributed != dset._distributed:
             raise ValueError(
@@ -5621,14 +5741,27 @@ def _concatenate_iterable_datasets(
                 "Some of the datasets have disparate format or format not set. Resetting the format of the concatenated dataset."
             )
 
-    # TODO: improve this to account for a mix of ClassLabel and Value for example
-    # right now it would keep the type of the first dataset in the list
-    features = Features(
-        {k: v for features in _align_features([dset.features for dset in dsets]) for k, v in features.items()}
-    )
+    if axis != 0:
+        # Horizontal concatenation keeps every shard's columns side by side.
+        features = Features(
+            {k: v for dset_features in [dset.features for dset in dsets] for k, v in dset_features.items()}
+        )
 
     ex_iterables = [deepcopy(d._ex_iterable) for d in dsets]
     if axis == 0:
+        if merge_report is not None and merge_report.has_promotions:
+            # Wrap each source so its arrow batches are cast to the unified
+            # schema lazily, one batch at a time. The shard index is needed to
+            # look up the right per-shard promotions (e.g. class label mapping).
+            ex_iterables = [
+                SchemaUnifyingExamplesIterable(
+                    ex_iterable,
+                    shard_index=index,
+                    unified_features=features,
+                    merge_report=merge_report,
+                )
+                for index, ex_iterable in enumerate(ex_iterables)
+            ]
         ex_iterable = VerticallyConcatenatedMultiSourcesExamplesIterable(ex_iterables)
     else:
         if all(ex_iterable.iter_arrow for ex_iterable in ex_iterables):
@@ -5656,6 +5789,7 @@ def _concatenate_iterable_datasets(
         token_per_repo_id=token_per_repo_id,
         formatting=formatting,
         distributed=dsets[0]._distributed,
+        merge_report=merge_report,
     )
 
 
