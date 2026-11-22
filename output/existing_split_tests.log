@@ -1,0 +1,37 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.4, pytest-8.4.2, pluggy-1.7.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/wll/uid75
+configfile: pyproject.toml
+plugins: xdist-3.8.0, cov-7.1.0, doctestplus-1.4.0, order-1.5.0, timeout-2.4.0, rerunfailures-16.0.1, platformdirs-4.14.7, mock-3.17.0, hf-doc-builder-0.6.0, anyio-4.16.0, subtests-0.15.0, typeguard-4.4.4
+collecting ... collected 474 items / 447 deselected / 27 selected
+
+tests/test_arrow_dataset.py::BaseDatasetTest::test_shard_in_memory PASSED [  3%]
+tests/test_arrow_dataset.py::BaseDatasetTest::test_shard_on_disk PASSED  [  7%]
+tests/test_arrow_dataset.py::BaseDatasetTest::test_train_test_split_in_memory PASSED [ 11%]
+tests/test_arrow_dataset.py::BaseDatasetTest::test_train_test_split_on_disk PASSED [ 14%]
+tests/test_arrow_dataset.py::test_dataset_from_csv_split[None] PASSED    [ 18%]
+tests/test_arrow_dataset.py::test_dataset_from_csv_split[split1] PASSED  [ 22%]
+tests/test_arrow_dataset.py::test_dataset_from_csv_split[train] PASSED   [ 25%]
+tests/test_arrow_dataset.py::test_dataset_from_csv_split[test] PASSED    [ 29%]
+tests/test_arrow_dataset.py::test_dataset_from_json_split[None] PASSED   [ 33%]
+tests/test_arrow_dataset.py::test_dataset_from_json_split[split1] PASSED [ 37%]
+tests/test_arrow_dataset.py::test_dataset_from_json_split[train] PASSED  [ 40%]
+tests/test_arrow_dataset.py::test_dataset_from_json_split[test] PASSED   [ 44%]
+tests/test_arrow_dataset.py::test_dataset_from_parquet_split[None] PASSED [ 48%]
+tests/test_arrow_dataset.py::test_dataset_from_parquet_split[split1] PASSED [ 51%]
+tests/test_arrow_dataset.py::test_dataset_from_parquet_split[train] PASSED [ 55%]
+tests/test_arrow_dataset.py::test_dataset_from_parquet_split[test] PASSED [ 59%]
+tests/test_arrow_dataset.py::test_dataset_from_text_split[None] PASSED   [ 62%]
+tests/test_arrow_dataset.py::test_dataset_from_text_split[split1] PASSED [ 66%]
+tests/test_arrow_dataset.py::test_dataset_from_text_split[train] PASSED  [ 70%]
+tests/test_arrow_dataset.py::test_dataset_from_text_split[test] PASSED   [ 74%]
+tests/test_arrow_dataset.py::test_dataset_from_generator_split[None] PASSED [ 77%]
+tests/test_arrow_dataset.py::test_dataset_from_generator_split[split1] PASSED [ 81%]
+tests/test_arrow_dataset.py::test_dataset_from_generator_split[train] PASSED [ 85%]
+tests/test_arrow_dataset.py::test_dataset_from_generator_split[split3] PASSED [ 88%]
+tests/test_arrow_dataset.py::test_dataset_from_generator_split[foo] PASSED [ 92%]
+tests/test_arrow_dataset.py::StratifiedTest::test_errors_train_test_split_stratify PASSED [ 96%]
+tests/test_arrow_dataset.py::StratifiedTest::test_train_test_split_startify PASSED [100%]
+
+====================== 27 passed, 447 deselected in 0.72s ======================

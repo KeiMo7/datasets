@@ -120,6 +120,32 @@ The [`~Dataset.train_test_split`] function creates train and test splits if your
 
 The splits are shuffled by default, but you can set `shuffle=False` to prevent shuffling.
 
+### Group-aware split
+
+When rows describe the same real-world entity (for example the same customer recorded under different sample ids or at different collection times), a random split can put that entity on both the train and the evaluation side. Offline validation then measures memorization and the score drops after deployment.
+
+[`~Dataset.group_train_test_split`] splits **groups** instead of rows: all rows sharing the same values in one or more `group_by_columns` are always assigned to the same side. Group integrity is a hard constraint, while the target ratio is approached as closely as possible with whole groups. The achieved ratio and its deviation from the target are reported, and a `seed` makes the result reproducible across machines and processes — group key hashes and traversal orders never participate in the random decisions.
+
+```py
+>>> dataset.group_train_test_split(group_by_columns="customer_id", test_size=0.2, seed=42)
+DatasetDict({
+    train: Dataset({ ..., num_rows: ... }),
+    test: Dataset({ ..., num_rows: ... }),
+})
+>>> dataset_dict.split_report.ratio_deviations
+{'train': 0.0, 'test': 0.0}
+```
+
+Pass `val_size` to obtain pairwise group-disjoint `train`/`validation`/`test` splits, `stratify_by_column` to keep label proportions as close as possible inside the group constraint, or `time_column` to ensure no training sample is newer than an evaluation sample. Rows with null group values are handled explicitly with `null_group_policy` (`"error"`, `"drop"` or `"singleton"` — null rows are never silently merged into one group). When a target ratio is unreachable, the closest feasible assignment is returned with `split_report.feasibility == "degraded"` and the measured deviation instead of being reported as a success.
+
+Set `manifest_path` to export a row-level manifest (each row's side and group key digest) that can be re-validated independently of the split run, including in another process:
+
+```py
+>>> result = dataset.verify_group_split("split_manifest.json")
+>>> result["ok"], result["shared_groups"]
+(True, [])
+```
+
 ### Shard
 
 🤗 Datasets supports sharding to divide a very large dataset into a predefined number of chunks. Specify the `num_shards` parameter in [`~Dataset.shard`] to determine the number of shards to split the dataset into. You'll also need to provide the shard you want to return with the `index` parameter.

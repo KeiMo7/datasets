@@ -112,6 +112,14 @@ from .fingerprint import (
 )
 from .formatting import format_table, get_format_type_from_alias, get_formatter, query_table
 from .formatting.formatting import LazyDict, _is_range_contiguous
+from .group_split import (
+    GROUP_KEY_RULE,
+    GroupSplitError,
+    build_manifest,
+    group_split_indices,
+    verify_group_split_manifest,
+    write_group_split_manifest,
+)
 from .info import DatasetInfo, DatasetInfosDict
 from .naming import _split_re
 from .search import IndexableMixin
@@ -5343,6 +5351,219 @@ class Dataset(DatasetInfoMixin, IndexableMixin, TensorflowDatasetMixin):
         )
 
         return DatasetDict({"train": train_split, "test": test_split})
+
+    def group_train_test_split(
+        self,
+        group_by_columns: Union[str, list[str]],
+        test_size: Union[float, int],
+        val_size: Union[float, int, None] = None,
+        seed: int = 0,
+        stratify_by_column: Optional[str] = None,
+        time_column: Optional[str] = None,
+        null_group_policy: str = "error",
+        ratio_tolerance: float = 0.05,
+        strict: bool = False,
+        n_restarts: int = 32,
+        manifest_path: Optional[str] = None,
+        keep_in_memory: bool = False,
+        load_from_cache_file: Optional[bool] = None,
+        writer_batch_size: Optional[int] = 1000,
+    ) -> "DatasetDict":
+        """Split the dataset while keeping all rows of the same group on one side.
+
+        A group is defined by one or more columns (``group_by_columns``): two
+        rows share a group when their values on these columns are equal after
+        canonical serialization. The split is performed on **groups**, not on
+        rows, so the same customer (or any other entity), even when recorded
+        under different sample ids or collected at different times, can never
+        appear in both the train and the evaluation side.
+
+        This method does not modify :meth:`Dataset.train_test_split`; the
+        random and stratified split behaviors are unchanged.
+
+        Group key derivation (also stored verbatim in the manifest and the
+        report):
+
+        ```
+        {group_key_rule}
+        ```
+
+        Args:
+            group_by_columns (`Union[str, List[str]]`):
+                Column name or list of column names defining a group.
+            test_size (`Union[float, int]`):
+                Proportion (float in the (0, 1) range) or absolute number
+                (int) of samples of the test side.
+            val_size (`Union[float, int, None]`, *optional*):
+                When given, a third `validation` side is created. The three
+                sides are pairwise group-disjoint.
+            seed (`int`, defaults to `0`):
+                Seed of the reproducible random decisions. Group key hashes
+                and dictionary traversal orders are never used as a source of
+                randomness, so identical inputs and seed give identical
+                results across machines and processes.
+            stratify_by_column (`str`, *optional*):
+                Name of a [`~datasets.features.ClassLabel`] column. Group
+                integrity remains the hard constraint; label proportions are
+                optimized as a soft objective inside each group.
+            time_column (`str`, *optional*):
+                Name of a timestamp column (datetimes, ISO strings or numeric
+                epochs). When set, groups are ordered in time and cut
+                contiguously so that no row of an earlier side is newer than
+                any row of a later side (no future sample in train).
+            null_group_policy (`str`, defaults to `"error"`):
+                How rows with a null/NaN value in a group column are handled:
+
+                - `"error"` (default): raise [`~datasets.group_split.GroupSplitError`];
+                - `"drop"`: exclude these rows from every side and count them
+                  separately in the report and the manifest;
+                - `"singleton"`: give each null row its own unique group, so
+                  null values are never treated as one shared group.
+
+            ratio_tolerance (`float`, defaults to `0.05`):
+                Maximum accepted absolute difference between the target and
+                the actual per-side sample ratio. When the whole-group
+                constraint makes the target unreachable, the closest feasible
+                assignment is returned with `report.feasibility == "degraded"`
+                and the numerical deviation, instead of being reported as a
+                success.
+            strict (`bool`, defaults to `False`):
+                If `True`, raise instead of returning a degraded assignment.
+            n_restarts (`int`, defaults to `32`):
+                Number of seeded greedy packing restarts. Restart 0 is always
+                deterministic largest-first packing.
+            manifest_path (`str`, *optional*):
+                If given, an atomic JSON manifest is written there. It lists
+                every row's side and group key digest, the full split report
+                and the group key rule, and can be checked independently with
+                [`~datasets.verify_group_split_manifest`].
+            keep_in_memory (`bool`, defaults to `False`):
+                Keep the split indices in memory instead of writing cache files.
+            load_from_cache_file (`Optional[bool]`, defaults to caching setting):
+                Reuse cached split indices when available.
+            writer_batch_size (`int`, defaults to `1000`):
+                Number of rows per write operation for the cache file writer.
+
+        Returns:
+            [`DatasetDict`]: a `DatasetDict` with `train`/`test` (and
+            `validation`) keys. The split report is attached as
+            `datasets_dict.split_report`; when `manifest_path` is set, the
+            manifest path is available as `datasets_dict.split_manifest_path`.
+        """.format(group_key_rule=GROUP_KEY_RULE)
+        from .dataset_dict import DatasetDict  # import here because of circular dependency
+
+        if len(self.list_indexes()) > 0:
+            raise DatasetTransformationNotAllowedError(
+                "Using `.group_train_test_split` on a dataset with attached indexes is not allowed. "
+                "You can first run `.drop_index()` to remove your index and then re-add it."
+            )
+        if len(self) == 0:
+            raise GroupSplitError("Cannot split an empty dataset.")
+
+        if isinstance(group_by_columns, str):
+            group_by_columns = [group_by_columns]
+        group_by_columns = list(group_by_columns)
+
+        if stratify_by_column is not None:
+            if stratify_by_column not in self._info.features.keys():
+                raise GroupSplitError(f"Key {stratify_by_column} not found in {self._info.features.keys()}")
+            if not isinstance(self._info.features[stratify_by_column], ClassLabel):
+                raise GroupSplitError(
+                    "Stratifying by column is only supported for a ClassLabel column, and column "
+                    f"{stratify_by_column} is {type(self._info.features[stratify_by_column]).__name__}."
+                )
+
+        needed_columns = set(group_by_columns)
+        if stratify_by_column is not None:
+            needed_columns.add(stratify_by_column)
+        if time_column is not None:
+            needed_columns.add(time_column)
+        missing = [c for c in needed_columns if c not in self.column_names]
+        if missing:
+            raise GroupSplitError(f"Column(s) not found in the dataset: {missing}")
+
+        # Column access only; the Dataset structure and serialization are untouched.
+        columns = {name: self[name] for name in needed_columns}
+
+        side_sizes = {"test": test_size}
+        if val_size is not None:
+            side_sizes["validation"] = val_size
+
+        indices, report, groups, dropped_rows = group_split_indices(
+            columns=columns,
+            group_columns=group_by_columns,
+            side_sizes=side_sizes,
+            seed=seed,
+            stratify_by_column=stratify_by_column,
+            time_column=time_column,
+            null_group_policy=null_group_policy,
+            n_restarts=n_restarts,
+            ratio_tolerance=ratio_tolerance,
+            strict=strict,
+        )
+
+        load_from_cache_file = load_from_cache_file if load_from_cache_file is not None else is_caching_enabled()
+
+        # Build the actual datasets from the single assignment behind the report.
+        split_datasets = {}
+        for side in report.side_names:
+            cache_file_name = None
+            if self.cache_files and not keep_in_memory and load_from_cache_file:
+                cache_file_name = self._get_cache_file_path(generate_random_fingerprint())
+            split_datasets[side] = self.select(
+                indices=indices[side],
+                keep_in_memory=keep_in_memory,
+                indices_cache_file_name=cache_file_name,
+                writer_batch_size=writer_batch_size,
+            )
+
+        dataset_dict = DatasetDict(split_datasets)
+        # The report object is the same source used to build datasets and manifest.
+        dataset_dict.split_report = report
+
+        if manifest_path is not None:
+            # Reconstruct the exact assignment from row membership instead of
+            # recomputing anything, to guarantee a single source of truth.
+            side_of_group: dict[str, str] = {}
+            for side in report.side_names:
+                side_row_set = {int(i) for i in indices[side].tolist()}
+                for g, rows in groups.items():
+                    if rows and rows[0] in side_row_set:
+                        side_of_group[g] = side
+            assignment = {
+                side: [g for g, owner in side_of_group.items() if owner == side] for side in report.side_names
+            }
+            manifest = build_manifest(
+                groups=groups,
+                assignment=assignment,
+                report=report,
+                dropped_rows=dropped_rows,
+                extra={
+                    "num_rows": len(self),
+                    "stratify_by_column": stratify_by_column,
+                },
+            )
+            write_group_split_manifest(manifest, manifest_path)
+            dataset_dict.split_manifest_path = os.path.abspath(manifest_path)
+
+        return dataset_dict
+
+    def verify_group_split(
+        self,
+        manifest_path: str,
+        time_column: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Re-validate an exported group split manifest against this dataset.
+
+        This only reads the manifest file and the current dataset columns; it
+        does not rely on any in-memory state from the split run. See
+        [`~datasets.verify_group_split_manifest`] for the returned structure.
+        """
+        return verify_group_split_manifest(
+            manifest_path=manifest_path,
+            columns={name: self[name] for name in self.column_names},
+            time_column=time_column,
+        )
 
     def shard(
         self,

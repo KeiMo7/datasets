@@ -1,0 +1,49 @@
+Synthetic leakage scenario: 921 rows, 200 customer groups
+
+==============================================================================
+1. Two-way grouped + stratified split: zero shared groups, ratio deviation
+==============================================================================
+shared groups train/test            : 0
+sample counts                       : {'train': 690, 'test': 231}
+group counts                        : {'train': 144, 'test': 56}
+target ratios                       : {'test': 0.2508, 'train': 0.7492}
+actual ratios                       : {'train': 0.7492, 'test': 0.2508}
+ratio deviations                    : {'train': 0.0, 'test': 0.0}
+within tolerance 0.05             : True
+feasibility                         : ok
+label distribution                  : {'train': {'0': 217, '1': 235, '2': 238}, 'test': {'0': 72, '1': 79, '2': 80}}
+
+==============================================================================
+2. Seeded reproducibility (same seed, two independent calls)
+==============================================================================
+identical assignments with same seed: True
+
+==============================================================================
+3. Three-way split: pairwise group-disjoint
+==============================================================================
+shared groups train     /validation: 0
+shared groups train     /test      : 0
+shared groups validation/test      : 0
+sample counts                       : {'train': 643, 'validation': 93, 'test': 185}
+group counts                        : {'train': 115, 'validation': 34, 'test': 51}
+
+==============================================================================
+4. Temporal split: no future sample in train
+==============================================================================
+max(train time) <= min(test time)   : True
+report.time_order_ok                : True
+ratio deviations                    : {'train': -0.002172, 'test': 0.002172}
+
+==============================================================================
+5. Manifest export and state-independent verification
+==============================================================================
+manifest_2way.json
+  file-only verification ok         : True (shared=[])
+  data-backed verification ok       : True (errors=[])
+manifest_3way.json
+  file-only verification ok         : True (shared=[])
+  data-backed verification ok       : True (errors=[])
+
+Wrote /home/wll/uid75/output/manifest_2way.json, /home/wll/uid75/output/manifest_3way.json and /home/wll/uid75/output/split_report_summary.json
+
+All acceptance checks passed.

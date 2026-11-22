@@ -22,6 +22,14 @@ from .dataset_dict import DatasetDict, IterableDatasetDict
 from .download import *
 from .features import *
 from .fingerprint import disable_caching, enable_caching, is_caching_enabled
+from .group_split import (
+    GROUP_KEY_RULE,
+    GroupSplitError,
+    SplitReport,
+    group_split_indices,
+    verify_group_split_manifest,
+    write_group_split_manifest,
+)
 from .info import DatasetInfo
 from .inspect import (
     get_dataset_config_info,

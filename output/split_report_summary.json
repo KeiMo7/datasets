@@ -1,0 +1,134 @@
+{
+  "group_key_rule": "The group key of a row is the JSON object (json.dumps with sort_keys=True, separators=(',', ':'), ensure_ascii=False, default=str) built from the configured group columns in the order they were given; null group values are handled separately according to null_group_policy. The group key digest is sha256(key.encode('utf-8')).hexdigest() of the canonical JSON string. Digests and traversal orders never participate in random decisions.",
+  "temporal": {
+    "actual_ratios": {
+      "test": 0.252985884907709,
+      "train": 0.747014115092291
+    },
+    "feasibility": "ok",
+    "group_columns": [
+      "customer_id"
+    ],
+    "group_counts": {
+      "test": 49,
+      "train": 151
+    },
+    "group_key_rule": "The group key of a row is the JSON object (json.dumps with sort_keys=True, separators=(',', ':'), ensure_ascii=False, default=str) built from the configured group columns in the order they were given; null group values are handled separately according to null_group_policy. The group key digest is sha256(key.encode('utf-8')).hexdigest() of the canonical JSON string. Digests and traversal orders never participate in random decisions.",
+    "label_distribution": {},
+    "null_group_policy": "error",
+    "null_rows": 0,
+    "ratio_deviations": {
+      "test": 0.0021715526601520097,
+      "train": -0.0021715526601520097
+    },
+    "sample_counts": {
+      "test": 233,
+      "train": 688
+    },
+    "seed": 3,
+    "side_names": [
+      "train",
+      "test"
+    ],
+    "target_ratios": {
+      "test": 0.250814332247557,
+      "train": 0.749185667752443
+    },
+    "time_column": "collected_at",
+    "time_order_ok": true,
+    "warnings": []
+  },
+  "three_way": {
+    "actual_ratios": {
+      "test": 0.2008686210640608,
+      "train": 0.6981541802388708,
+      "validation": 0.10097719869706841
+    },
+    "feasibility": "ok",
+    "group_columns": [
+      "customer_id"
+    ],
+    "group_counts": {
+      "test": 51,
+      "train": 115,
+      "validation": 34
+    },
+    "group_key_rule": "The group key of a row is the JSON object (json.dumps with sort_keys=True, separators=(',', ':'), ensure_ascii=False, default=str) built from the configured group columns in the order they were given; null group values are handled separately according to null_group_policy. The group key digest is sha256(key.encode('utf-8')).hexdigest() of the canonical JSON string. Digests and traversal orders never participate in random decisions.",
+    "label_distribution": {},
+    "null_group_policy": "error",
+    "null_rows": 0,
+    "ratio_deviations": {
+      "test": 0.0,
+      "train": 0.0,
+      "validation": 0.0
+    },
+    "sample_counts": {
+      "test": 185,
+      "train": 643,
+      "validation": 93
+    },
+    "seed": 7,
+    "side_names": [
+      "train",
+      "validation",
+      "test"
+    ],
+    "target_ratios": {
+      "test": 0.2008686210640608,
+      "train": 0.6981541802388708,
+      "validation": 0.10097719869706841
+    },
+    "time_column": null,
+    "time_order_ok": null,
+    "warnings": []
+  },
+  "two_way": {
+    "actual_ratios": {
+      "test": 0.250814332247557,
+      "train": 0.749185667752443
+    },
+    "feasibility": "ok",
+    "group_columns": [
+      "customer_id"
+    ],
+    "group_counts": {
+      "test": 56,
+      "train": 144
+    },
+    "group_key_rule": "The group key of a row is the JSON object (json.dumps with sort_keys=True, separators=(',', ':'), ensure_ascii=False, default=str) built from the configured group columns in the order they were given; null group values are handled separately according to null_group_policy. The group key digest is sha256(key.encode('utf-8')).hexdigest() of the canonical JSON string. Digests and traversal orders never participate in random decisions.",
+    "label_distribution": {
+      "test": {
+        "0": 72,
+        "1": 79,
+        "2": 80
+      },
+      "train": {
+        "0": 217,
+        "1": 235,
+        "2": 238
+      }
+    },
+    "null_group_policy": "error",
+    "null_rows": 0,
+    "ratio_deviations": {
+      "test": 0.0,
+      "train": 0.0
+    },
+    "sample_counts": {
+      "test": 231,
+      "train": 690
+    },
+    "seed": 42,
+    "side_names": [
+      "train",
+      "test"
+    ],
+    "target_ratios": {
+      "test": 0.250814332247557,
+      "train": 0.749185667752443
+    },
+    "time_column": null,
+    "time_order_ok": null,
+    "warnings": []
+  }
+}
